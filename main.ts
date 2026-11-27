@@ -380,7 +380,7 @@ function cheapStreams(samples, width, height, bpp) {
   return [...fixed, minsum, pairs];
 }
 
-const BRUTE_CONTEXT = 32768;
+const BRUTE_CONTEXT = 24576;
 const BRUTE_LEVEL = 3; // round 2: restored to 3 (L1 lost score)
 
 /** Brute-force per-row filter choice: the filter whose row deflates smallest after the 32 KiB before it. */
@@ -451,21 +451,35 @@ function buildCandLens(cap) {
   return table;
 }
 const CAND_LENS = buildCandLens(48);
-const CAND_LENS_BIG = buildCandLens(32);
+const CAND_LENS_BIG = buildCandLens(24);
 
 /** Pareto-optimal matches (<=258, window 32 KiB) at every position, via 3-byte
  *  hash chains: up to 8 (length, distance) offers per position, none dominated
  *  (another offer both longer and no farther). This is the sublen idea: the DP
  *  needs not just the longest match but every length/distance trade-off. */
+const matchScratch = { offerLen: null, offerDist: null, offerCnt: null, head: null, last3: null, prev: null };
 function findMatches(data, maxChain, niceLen) {
   const n = data.length;
-  const MAX_OFFERS = n <= 1200000 ? 6 : 4;
-  const offerLen = new Uint16Array(n * MAX_OFFERS);
-  const offerDist = new Uint16Array(n * MAX_OFFERS);
-  const offerCnt = new Uint8Array(n);
-  const head = new Int32Array(1048576).fill(-1);
-  const last3 = new Int32Array(65536).fill(-1);
-  const prev = new Int32Array(n).fill(-1);
+  const MAX_OFFERS = n <= 1200000 ? 6 : 3;
+  const need = n * MAX_OFFERS;
+  if (matchScratch.offerLen === null || matchScratch.offerLen.length < need) {
+    matchScratch.offerLen = new Uint16Array(need);
+    matchScratch.offerDist = new Uint16Array(need);
+    matchScratch.offerCnt = new Uint8Array(n);
+    matchScratch.prev = new Int32Array(n);
+  }
+  if (matchScratch.head === null) {
+    matchScratch.head = new Int32Array(1048576);
+    matchScratch.last3 = new Int32Array(65536);
+  }
+  const offerLen = matchScratch.offerLen;
+  const offerDist = matchScratch.offerDist;
+  const offerCnt = matchScratch.offerCnt;
+  offerCnt.fill(0, 0, n);
+  const head = matchScratch.head.fill(-1);
+  const last3 = matchScratch.last3.fill(-1);
+  const prev = matchScratch.prev;
+  prev.fill(-1, 0, n);
   const hash4 = (i) => (Math.imul((data[i] << 24) | (data[i + 1] << 16) | (data[i + 2] << 8) | data[i + 3], 0x9e3779b1) >>> 12) & 1048575;
   const hash3 = (i) => (Math.imul((data[i] << 16) | (data[i + 1] << 8) | data[i + 2], 0x9e3779b1) >>> 16) & 65535;
   const words = data.byteOffset % 4 === 0 ? new Uint32Array(data.buffer, data.byteOffset, n >>> 2) : null;
@@ -497,12 +511,15 @@ function findMatches(data, maxChain, niceLen) {
     let budget = maxChain;
     const maxLen = Math.min(258, n - i);
     const b0 = data[i], b1 = data[i + 1], b2 = data[i + 2], b3 = data[i + 3];
+    // Chain candidates arrive nearest-first (distances strictly increase),
+    // so every offer stored so far has distance <= the current candidate's.
+    // A new match is therefore useful only when it is longer than every
+    // offer so far (bestLen): anything shorter is dominated. That turns
+    // the Pareto maintenance into a single comparison.
     while (cand >= 0 && i - cand <= 32768 && budget-- > 0) {
       const d = i - cand;
       if (data[cand] === b0 && data[cand + 1] === b1 && data[cand + 2] === b2 && data[cand + 3] === b3) {
-        let mustBeat = 0;
-        for (let k = 0; k < cnt; k++) if (tmpDist[k] <= d && tmpLen[k] > mustBeat) mustBeat = tmpLen[k];
-        if (mustBeat === 0 || (mustBeat < maxLen && data[cand + mustBeat] === data[i + mustBeat])) {
+        if (bestLen === 0 || (bestLen < maxLen && data[cand + bestLen] === data[i + bestLen])) {
           let l = 4;
           if (words !== null) {
             while (l < maxLen && ((i + l) & 3) !== 0 && data[cand + l] === data[i + l]) l++;
@@ -520,14 +537,24 @@ function findMatches(data, maxChain, niceLen) {
           while (l < maxLen && data[cand + l] === data[i + l]) l++;
           if (l > bestLen) {
             bestLen = l;
-            if (l >= niceLen && l < 258) budget = Math.min(budget, 2);
-            else if (l >= 32 && l < niceLen) budget = Math.min(budget, 8);
-          }
-          cnt = addOffer(l, d, cnt);
-          if (bestLen >= 258) {
-            let has258 = false;
-            for (let k = 0; k < cnt; k++) if (tmpLen[k] >= 258) { has258 = true; break; }
-            if (has258) break;
+            if (cnt < MAX_OFFERS) { tmpLen[cnt] = l; tmpDist[cnt] = d; cnt++; }
+            else {
+              // Full: drop the offer whose length gain over its predecessor
+              // in the frontier is smallest (least useful), keep the new one.
+              let dropK = 0, dropGain = Infinity, prevLen = 0;
+              const order = [];
+              for (let k = 0; k < cnt; k++) order.push(k);
+              order.sort((a, b) => tmpDist[a] - tmpDist[b]);
+              for (const k of order) {
+                const gain = tmpLen[k] - prevLen;
+                if (gain < dropGain) { dropGain = gain; dropK = k; }
+                prevLen = tmpLen[k];
+              }
+              tmpLen[dropK] = l; tmpDist[dropK] = d;
+            }
+            if (l >= 258) break;
+            if (l >= niceLen) budget = Math.min(budget, 2);
+            else if (l >= 32) budget = Math.min(budget, 4);
           }
         }
       }
@@ -630,25 +657,34 @@ const FIXED_DIST_LEN = new Uint8Array(32).fill(5);
  * (extra bits added here). Each position offers its longest match and its
  * cheapest-distance match. Returns the token list and the parse's bit cost.
  */
-function optimalParse(data, matches, litCost, distCost, candTable = CAND_LENS) {
+const parseScratch = { cost: null, choice: null, choiceDist: null };
+function optimalParse(data, matches, litCost, distCost, candTable = CAND_LENS, start = 0, end = data.length) {
   const { offerLen, offerDist, offerCnt, maxOffers } = matches;
-  const n = data.length;
-  const cost = new Float64Array(n + 1).fill(Infinity);
-  const choice = new Int32Array(n + 1); // token length ending at i (1 = literal)
-  const choiceDist = new Uint16Array(n + 1); // distance of the match ending at i
+  const n = end - start;
+  if (parseScratch.cost === null || parseScratch.cost.length < n + 1) {
+    parseScratch.cost = new Float64Array(n + 1);
+    parseScratch.choice = new Int32Array(n + 1);
+    parseScratch.choiceDist = new Uint16Array(n + 1);
+  }
+  const cost = parseScratch.cost.fill(Infinity, 0, n + 1);
+  const choice = parseScratch.choice; // token length ending at i (1 = literal)
+  const choiceDist = parseScratch.choiceDist; // distance of the match ending at i
   const lenCost = new Float64Array(259);
   for (let l = 3; l <= 258; l++) lenCost[l] = litCost[LEN_SYM[l]] + LEN_XB[l];
   cost[0] = 0;
   for (let i = 0; i < n; i++) {
     const ci = cost[i];
     if (ci === Infinity) continue;
-    const litTotal = ci + litCost[data[i]];
+    const gi = start + i;
+    const litTotal = ci + litCost[data[gi]];
     if (litTotal < cost[i + 1]) { cost[i + 1] = litTotal; choice[i + 1] = 1; }
-    const cnt = offerCnt[i];
+    const cnt = offerCnt[gi];
     if (cnt > 0) {
-      const base = i * maxOffers;
+      const base = gi * maxOffers;
+      const room = n - i;
       for (let k = 0; k < cnt; k++) {
-        const L = offerLen[base + k];
+        const L = Math.min(offerLen[base + k], room);
+        if (L < 3) continue;
         const d = offerDist[base + k];
         const bc = ci + distCost[DIST_SYM[d]] + DIST_XB[d];
         const cands = candTable[L];
@@ -663,10 +699,10 @@ function optimalParse(data, matches, litCost, distCost, candTable = CAND_LENS) {
   const rev = [];
   for (let at = n; at > 0;) {
     const l = choice[at];
-    const start = at - l;
-    if (l === 1) rev.push({ match: false, byte: data[start] });
+    const s = at - l;
+    if (l === 1) rev.push({ match: false, byte: data[start + s] });
     else rev.push({ match: true, len: l, dist: choiceDist[at] });
-    at = start;
+    at = s;
   }
   rev.reverse();
   return { tokens: rev, bits: cost[n] };
@@ -851,16 +887,19 @@ function optimalZlib(data) {
     };
     if (n <= 3000000) {
       let gain = sampleGain(data.subarray(0, 262144));
+      if (gain < 0.025) gain = Math.max(gain, sampleGain(data.subarray((n >> 1) - 131072, (n >> 1) + 131072)));
       if (gain < 0.025) gain = Math.max(gain, sampleGain(data.subarray(n - 262144, n)));
       if (gain < 0.005) return null;
       // A small sample gain means shallow chains understate the win
       // (photo-like RGB): spend a deep chain. A clear gain needs less.
-      return optimalZlibInner(data, gain < 0.025 ? 224 : 112, 2, 64);
+      return optimalZlibInner(data, gain < 0.025 ? 160 : 96, 1, 64);
     }
-    if (sampleGain(data.subarray(0, 262144)) < 0.025) return null;
-    return optimalZlibInner(data, 80, 2, 64);
+    let gain3 = sampleGain(data.subarray(0, 262144));
+    if (gain3 < 0.025) gain3 = Math.max(gain3, sampleGain(data.subarray((n >> 1) - 131072, (n >> 1) + 131072)));
+    if (gain3 < 0.025) return null;
+    return optimalZlibInner(data, 80, 1, 64);
   }
-  return optimalZlibInner(data, n <= 1048576 ? 96 : 64, 4, 64);
+  return optimalZlibInner(data, n <= 1048576 ? 96 : 64, 3, 64);
 }
 function optimalZlibInner(data, maxChain, iterations, niceLen) {
   const n = data.length;
@@ -868,6 +907,14 @@ function optimalZlibInner(data, maxChain, iterations, niceLen) {
 
   let litCost = costsOf(FIXED_LIT_LEN, 9);
   let distCost = costsOf(FIXED_DIST_LEN, 5);
+  if (n > 1200000) {
+    const bf = new Int32Array(288);
+    for (let i = 0; i < n; i++) bf[data[i]]++;
+    bf[256] = 1;
+    litCost = costsOf(huffmanLengths(bf, 15), 15);
+    const fx = costsOf(FIXED_LIT_LEN, 9);
+    for (let s = 257; s < 286; s++) litCost[s] = fx[s];
+  }
   let tokens = null;
   let prevBits = Infinity;
   for (let iter = 0; iter < iterations; iter++) {
@@ -891,7 +938,7 @@ function optimalZlibInner(data, maxChain, iterations, niceLen) {
 
   // Block splitting: equal-token splits plus a DP over chunk boundaries
   // (entropy-estimated block costs), each scored exactly by planBlock.
-  const splitCounts = tokens.length > 20000 ? [1, 2, 3, 4, 6, 8] : [1];
+  const splitCounts = tokens.length > 20000 ? [1, 2, 4] : [1];
   let bestPlan = null;
   const considerSplit = (bounds) => {
     const plans = [];
@@ -963,6 +1010,53 @@ function optimalZlibInner(data, maxChain, iterations, niceLen) {
     bounds.push(0);
     bounds.reverse();
     considerSplit(bounds);
+  }
+
+  // Per-block re-parse (zopfli-style): with the split fixed, re-run the
+  // optimal parse inside each block under block-local Huffman costs.
+  // Screenshots mix flat UI, text and photo patches whose statistics
+  // differ sharply; a single global parse cannot price all of them well.
+  // Matches come from the global match table (the deflate window spans
+  // blocks), lengths capped at the block end by optimalParse's range.
+  if (bestPlan.plans.length > 1) {
+    const bytePos = new Int32Array(tokens.length + 1);
+    for (let t = 0; t < tokens.length; t++) bytePos[t + 1] = bytePos[t] + (tokens[t].match ? tokens[t].len : 1);
+    const candTable = n > 1200000 ? CAND_LENS_BIG : CAND_LENS;
+    const rePlans = [];
+    let reTotal = 0;
+    let reTokens = [];
+    for (const { from, to } of bestPlan.plans) {
+      const bs = bytePos[from], be = bytePos[to];
+      let bLit = litCost, bDist = distCost;
+      let bTokens = tokens.slice(from, to);
+      let bPrev = Infinity;
+      const reIters = n > 1200000 ? 1 : 2;
+      for (let it = 0; it < reIters; it++) {
+        const parsed = optimalParse(data, matches, bLit, bDist, candTable, bs, be);
+        bTokens = parsed.tokens;
+        const { litFreq, distFreq } = countSymbols(bTokens);
+        const ll = huffmanLengths(litFreq, 15);
+        const dl = huffmanLengths(distFreq, 15);
+        let bits = 0;
+        for (const t of bTokens) {
+          bits += t.match
+            ? ll[LEN_SYM[t.len]] + LEN_XB[t.len] + dl[DIST_SYM[t.dist]] + DIST_XB[t.dist]
+            : ll[t.byte];
+        }
+        if (bits >= bPrev) break;
+        bPrev = bits;
+        bLit = smoothedCosts(litFreq);
+        bDist = smoothedCosts(distFreq);
+      }
+      const plan = planBlock(bTokens);
+      rePlans.push({ plan, from: reTokens.length, to: reTokens.length + bTokens.length });
+      reTokens = reTokens.concat(bTokens);
+      reTotal += plan.bits;
+    }
+    if (reTotal < bestPlan.total) {
+      tokens = reTokens;
+      bestPlan = { plans: rePlans, total: reTotal };
+    }
   }
 
   const w = makeBitWriter();
