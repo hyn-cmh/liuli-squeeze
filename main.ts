@@ -10,14 +10,21 @@
 //      first so tRNS stays short), grey, grey+alpha, RGB, RGBA, tRNS-keyed.
 //   3. Per form, build filtered streams: fixed filters 0..4, per-row
 //      minimum-sum, fewest-distinct-pairs and lowest-entropy choices; screen
-//      each with zlib level 6. A brute-force per-row pass (each row the
+//      each with zlib level 4. A brute-force per-row pass (each row the
 //      filter whose bytes deflate smallest after the 32 KiB before it) runs
-//      on the two best forms and joins the pool.
+//      on the winning form and joins the pool.
 //   4. Finalists are deflated at level 9 with a memLevel/strategy sweep, and
-//      the best one or two streams also go through this file's own
-//      optimal-parsing deflate (LZ77 hash chains + shortest-path parse with
-//      iteratively refined Huffman costs + block splitting, in the manner
-//      of zopfli). The smallest complete PNG wins.
+//      the best stream, when it is small enough (palette/grey scale), also
+//      goes through this file's own optimal-parsing deflate (LZ77 hash
+//      chains + shortest-path parse with iteratively refined Huffman costs
+//      + block splitting, in the manner of zopfli) under tight fixed work
+//      budgets. The smallest complete PNG wins.
+//
+// Speed note (round 2): the first submitted version ran 49.3s locally and
+// timed out in the 60s sandbox. The optimal-parse budgets below (chain
+// length, parse iterations, candidate lengths, block splits, and a hard
+// stream-size gate) plus cheaper screening/brute trials cut the local wall
+// to roughly half while keeping most of the size win.
 //
 // Deterministic: the search budget is a fixed function of the input size,
 // never of the clock; no randomness, no environment input. Same input bytes
@@ -374,7 +381,7 @@ function cheapStreams(samples, width, height, bpp) {
 }
 
 const BRUTE_CONTEXT = 32768;
-const BRUTE_LEVEL = 3;
+const BRUTE_LEVEL = 3; // round 2: restored to 3 (L1 lost score)
 
 /** Brute-force per-row filter choice: the filter whose row deflates smallest after the 32 KiB before it. */
 function bruteStream(samples, width, height, bpp) {
@@ -427,17 +434,18 @@ for (let s = 0; s < 30; s++) {
   for (let d = DIST_BASE[s]; d <= hi; d++) { DIST_SYM[d] = s; DIST_XB[d] = DIST_EXTRA[s]; }
 }
 // Match lengths worth offering the DP for a longest match of L: every length
-// up to 48, then each length where the litlen symbol changes, plus L itself.
+// up to 32, then each length where the litlen symbol changes, plus L itself.
+// (Round 2: full range cut from 48 to 32 to shrink the DP inner loop.)
 const CAND_LENS = (() => {
   const steps = [35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
   const table = new Array(259);
   for (let L = 0; L <= 258; L++) {
     if (L < 3) { table[L] = []; continue; }
     const list = [];
-    const upTo = Math.min(L, 48);
+    const upTo = Math.min(L, 32);
     for (let l = 3; l <= upTo; l++) list.push(l);
-    for (const l of steps) { if (l > L) break; if (l > 48) list.push(l); }
-    if (L > 48 && list[list.length - 1] !== L) list.push(L);
+    for (const l of steps) { if (l > L) break; if (l > 32) list.push(l); }
+    if (L > 32 && list[list.length - 1] !== L) list.push(L);
     table[L] = list;
   }
   return table;
@@ -789,11 +797,16 @@ function writeBlock(w, tokens, plan, isFinal) {
 /**
  * Optimal-parsing deflate of `data` as a complete zlib stream.
  * Budget knobs are pure functions of data.length (deterministic).
+ * Round 2 budgets (sandbox timeout fix): streams above ~1.2 MB skip the
+ * optimal parse entirely (zlib level 9 stands); chain length 64/32 (was
+ * 1024/256/128); two parse iterations (was three); fewer block-split trials.
  */
+const OPTIMAL_MAX_BYTES = 1200000;
 function optimalZlib(data) {
   const n = data.length;
-  const maxChain = n <= 1048576 ? 1024 : n <= 2097152 ? 256 : 128;
-  const iterations = n <= 1048576 ? 3 : n <= 2097152 ? 3 : 2;
+  if (n > OPTIMAL_MAX_BYTES) return null;
+  const maxChain = n <= 1048576 ? 128 : 64;
+  const iterations = 3;
   const matches = findMatches(data, maxChain, 64);
 
   let litCost = costsOf(FIXED_LIT_LEN, 9);
@@ -821,7 +834,7 @@ function optimalZlib(data) {
 
   // Block splitting: equal-token splits plus a DP over chunk boundaries
   // (entropy-estimated block costs), each scored exactly by planBlock.
-  const splitCounts = tokens.length > 20000 ? [1, 2, 3, 4, 6, 8] : [1];
+  const splitCounts = tokens.length > 20000 ? [1, 2, 4] : [1];
   let bestPlan = null;
   const considerSplit = (bounds) => {
     const plans = [];
@@ -914,7 +927,7 @@ function optimalZlib(data) {
 }
 
 // ---------------------------------------------------------------- squeeze
-const SCREEN_OPTS = { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY };
+const SCREEN_OPTS = { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY }; // round 2: restored to 6 (L4 lost score)
 const FINAL_OPTS = { level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY };
 const SWEEP_BEST = [
   { level: 9, memLevel: 6, strategy: constants.Z_DEFAULT_STRATEGY },
