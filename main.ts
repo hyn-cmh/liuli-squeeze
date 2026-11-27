@@ -350,7 +350,7 @@ function distinctPairs(row, seen, stamp) {
 function cheapStreams(samples, width, height, bpp) {
   const stride = width * bpp;
   const size = height * (stride + 1);
-  const fixed = [0, 1, 2, 4].map((t) => ({ choice: t, data: new Uint8Array(size) }));
+  const fixed = [0, 1, 4].map((t) => ({ choice: t, data: new Uint8Array(size) }));
   const minsum = { choice: 'minsum', data: new Uint8Array(size) };
   const pairs = { choice: 'pairs', data: new Uint8Array(size) };
   const trial = Array.from({ length: 5 }, (_, t) => {
@@ -436,20 +436,22 @@ for (let s = 0; s < 30; s++) {
 // Match lengths worth offering the DP for a longest match of L: every length
 // up to 32, then each length where the litlen symbol changes, plus L itself.
 // (Round 2: full range cut from 48 to 32 to shrink the DP inner loop.)
-const CAND_LENS = (() => {
+function buildCandLens(cap) {
   const steps = [35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
   const table = new Array(259);
   for (let L = 0; L <= 258; L++) {
     if (L < 3) { table[L] = []; continue; }
     const list = [];
-    const upTo = Math.min(L, 32);
+    const upTo = Math.min(L, cap);
     for (let l = 3; l <= upTo; l++) list.push(l);
-    for (const l of steps) { if (l > L) break; if (l > 32) list.push(l); }
-    if (L > 32 && list[list.length - 1] !== L) list.push(L);
+    for (const l of steps) { if (l > L) break; if (l > cap) list.push(l); }
+    if (L > cap && list[list.length - 1] !== L) list.push(L);
     table[L] = list;
   }
   return table;
-})();
+}
+const CAND_LENS = buildCandLens(48);
+const CAND_LENS_BIG = buildCandLens(32);
 
 /** Pareto-optimal matches (<=258, window 32 KiB) at every position, via 3-byte
  *  hash chains: up to 8 (length, distance) offers per position, none dominated
@@ -457,40 +459,63 @@ const CAND_LENS = (() => {
  *  needs not just the longest match but every length/distance trade-off. */
 function findMatches(data, maxChain, niceLen) {
   const n = data.length;
-  const MAX_OFFERS = 4;
+  const MAX_OFFERS = n <= 1200000 ? 6 : 4;
   const offerLen = new Uint16Array(n * MAX_OFFERS);
   const offerDist = new Uint16Array(n * MAX_OFFERS);
   const offerCnt = new Uint8Array(n);
-  const head = new Int32Array(65536).fill(-1);
+  const head = new Int32Array(1048576).fill(-1);
+  const last3 = new Int32Array(65536).fill(-1);
   const prev = new Int32Array(n).fill(-1);
-  const hashAt = (i) => (Math.imul((data[i] << 16) | (data[i + 1] << 8) | data[i + 2], 0x9e3779b1) >>> 16) & 65535;
+  const hash4 = (i) => (Math.imul((data[i] << 24) | (data[i + 1] << 16) | (data[i + 2] << 8) | data[i + 3], 0x9e3779b1) >>> 12) & 1048575;
+  const hash3 = (i) => (Math.imul((data[i] << 16) | (data[i + 1] << 8) | data[i + 2], 0x9e3779b1) >>> 16) & 65535;
   const words = data.byteOffset % 4 === 0 ? new Uint32Array(data.buffer, data.byteOffset, n >>> 2) : null;
-  const lastStart = n - 3;
+  const lastStart = n - 4;
   const tmpLen = new Int32Array(MAX_OFFERS);
   const tmpDist = new Int32Array(MAX_OFFERS);
+  const addOffer = (l, d, cnt) => {
+    let dominated = false;
+    let w = 0;
+    for (let k = 0; k < cnt; k++) {
+      if (tmpLen[k] >= l && tmpDist[k] <= d) { dominated = true; break; }
+      if (!(l >= tmpLen[k] && d <= tmpDist[k])) { tmpLen[w] = tmpLen[k]; tmpDist[w] = tmpDist[k]; w++; }
+    }
+    if (dominated) return cnt;
+    cnt = w;
+    if (cnt < MAX_OFFERS) { tmpLen[cnt] = l; tmpDist[cnt] = d; cnt++; }
+    else {
+      let worstK = -1;
+      for (let k = 0; k < cnt; k++) if (tmpLen[k] <= l && (worstK < 0 || tmpDist[k] > tmpDist[worstK])) worstK = k;
+      if (worstK >= 0) { tmpLen[worstK] = l; tmpDist[worstK] = d; }
+    }
+    return cnt;
+  };
   for (let i = 0; i <= lastStart; i++) {
-    const h = hashAt(i);
+    const h = hash4(i);
     let cand = head[h];
     let bestLen = 0;
     let cnt = 0;
     let budget = maxChain;
     const maxLen = Math.min(258, n - i);
-    const b0 = data[i], b1 = data[i + 1], b2 = data[i + 2];
+    const b0 = data[i], b1 = data[i + 1], b2 = data[i + 2], b3 = data[i + 3];
     while (cand >= 0 && i - cand <= 32768 && budget-- > 0) {
       const d = i - cand;
-      // Hash collisions share no prefix; and a candidate whose byte at the
-      // length it must beat (the longest offer no farther than it) differs
-      // cannot enter the Pareto set: skip both without a full compare.
-      if (data[cand] === b0 && data[cand + 1] === b1 && data[cand + 2] === b2) {
+      if (data[cand] === b0 && data[cand + 1] === b1 && data[cand + 2] === b2 && data[cand + 3] === b3) {
         let mustBeat = 0;
         for (let k = 0; k < cnt; k++) if (tmpDist[k] <= d && tmpLen[k] > mustBeat) mustBeat = tmpLen[k];
         if (mustBeat === 0 || (mustBeat < maxLen && data[cand + mustBeat] === data[i + mustBeat])) {
-          let l = 3;
-          if (words !== null && (d & 3) === 0) {
+          let l = 4;
+          if (words !== null) {
             while (l < maxLen && ((i + l) & 3) !== 0 && data[cand + l] === data[i + l]) l++;
-            const wi = (i + l) >>> 2, wc = (cand + l) >>> 2;
-            let w = 0;
-            while (l + 4 <= maxLen && words[wc + w] === words[wi + w]) { l += 4; w++; }
+            if (((i + l) & 3) === 0) {
+              let wi = (i + l) >>> 2, wc = (cand + l) >>> 2;
+              const shB = ((cand + l) & 3) * 8;
+              if (shB === 0) {
+                let w = 0;
+                while (l + 4 <= maxLen && words[wc + w] === words[wi + w]) { l += 4; w++; }
+              } else {
+                while (l + 4 <= maxLen && (((words[wc] >>> shB) | (words[wc + 1] << (32 - shB))) >>> 0) === words[wi]) { l += 4; wi++; wc++; }
+              }
+            }
           }
           while (l < maxLen && data[cand + l] === data[i + l]) l++;
           if (l > bestLen) {
@@ -498,24 +523,8 @@ function findMatches(data, maxChain, niceLen) {
             if (l >= niceLen && l < 258) budget = Math.min(budget, 2);
             else if (l >= 32 && l < niceLen) budget = Math.min(budget, 8);
           }
-          let dominated = false;
-          let w = 0;
-          for (let k = 0; k < cnt; k++) {
-            if (tmpLen[k] >= l && tmpDist[k] <= d) { dominated = true; break; }
-            if (!(l >= tmpLen[k] && d <= tmpDist[k])) { tmpLen[w] = tmpLen[k]; tmpDist[w] = tmpDist[k]; w++; }
-          }
-          if (!dominated) {
-            cnt = w;
-            if (cnt < MAX_OFFERS) { tmpLen[cnt] = l; tmpDist[cnt] = d; cnt++; }
-            else {
-              let worstK = -1;
-              for (let k = 0; k < cnt; k++) if (tmpLen[k] <= l && (worstK < 0 || tmpDist[k] > tmpDist[worstK])) worstK = k;
-              if (worstK >= 0) { tmpLen[worstK] = l; tmpDist[worstK] = d; }
-            }
-          }
+          cnt = addOffer(l, d, cnt);
           if (bestLen >= 258) {
-            // A 258 offer exists; only a closer 258 could still help, and the
-            // chain is newest-first, so later candidates are all farther.
             let has258 = false;
             for (let k = 0; k < cnt; k++) if (tmpLen[k] >= 258) { has258 = true; break; }
             if (has258) break;
@@ -524,6 +533,13 @@ function findMatches(data, maxChain, niceLen) {
       }
       cand = prev[cand];
     }
+    // Nearest length-3 match via the 3-byte side table.
+    const h3 = hash3(i);
+    const c3 = last3[h3];
+    if (c3 >= 0 && i - c3 <= 32768 && data[c3] === b0 && data[c3 + 1] === b1 && data[c3 + 2] === b2) {
+      cnt = addOffer(3, i - c3, cnt);
+    }
+    last3[h3] = i;
     if (cnt > 0) {
       offerCnt[i] = cnt;
       const base = i * MAX_OFFERS;
@@ -531,6 +547,17 @@ function findMatches(data, maxChain, niceLen) {
     }
     prev[i] = head[h];
     head[h] = i;
+  }
+  // Tail positions (last 3) can still take a length-3 match.
+  for (let i = lastStart + 1; i + 2 < n; i++) {
+    const h3 = hash3(i);
+    const c3 = last3[h3];
+    if (c3 >= 0 && i - c3 <= 32768 && data[c3] === data[i] && data[c3 + 1] === data[i + 1] && data[c3 + 2] === data[i + 2]) {
+      offerCnt[i] = 1;
+      offerLen[i * MAX_OFFERS] = 3;
+      offerDist[i * MAX_OFFERS] = i - c3;
+    }
+    last3[h3] = i;
   }
   return { offerLen, offerDist, offerCnt, maxOffers: MAX_OFFERS };
 }
@@ -603,7 +630,7 @@ const FIXED_DIST_LEN = new Uint8Array(32).fill(5);
  * (extra bits added here). Each position offers its longest match and its
  * cheapest-distance match. Returns the token list and the parse's bit cost.
  */
-function optimalParse(data, matches, litCost, distCost) {
+function optimalParse(data, matches, litCost, distCost, candTable = CAND_LENS) {
   const { offerLen, offerDist, offerCnt, maxOffers } = matches;
   const n = data.length;
   const cost = new Float64Array(n + 1).fill(Infinity);
@@ -624,7 +651,7 @@ function optimalParse(data, matches, litCost, distCost) {
         const L = offerLen[base + k];
         const d = offerDist[base + k];
         const bc = ci + distCost[DIST_SYM[d]] + DIST_XB[d];
-        const cands = CAND_LENS[L];
+        const cands = candTable[L];
         for (let j = 0; j < cands.length; j++) {
           const l = cands[j];
           const c = bc + lenCost[l];
@@ -801,20 +828,50 @@ function writeBlock(w, tokens, plan, isFinal) {
  * optimal parse entirely (zlib level 9 stands); chain length 64/32 (was
  * 1024/256/128); two parse iterations (was three); fewer block-split trials.
  */
-const OPTIMAL_MAX_BYTES = 1200000;
+const OPTIMAL_MAX_BYTES = 4000000;
+const OPTIMAL_SMALL_MAX = 1200000;
+// Streams above OPTIMAL_SMALL_MAX get a sample test first: optimal-parse a
+// fixed 256 KiB prefix and compare with zlib level 9 on the same prefix.
+// Only when the sample gain clears 2.5% does the full stream get the
+// (expensive) optimal parse. Pure function of the data: deterministic.
 function optimalZlib(data) {
   const n = data.length;
   if (n > OPTIMAL_MAX_BYTES) return null;
-  const maxChain = n <= 1048576 ? 128 : 64;
-  const iterations = 3;
-  const matches = findMatches(data, maxChain, 64);
+  if (n > OPTIMAL_SMALL_MAX) {
+    // Sample gate on 256 KiB windows. A prefix-only sample proved
+    // unrepresentative (a photo patch at the top hides compressible
+    // structure below), so streams up to 3 MB also sample the tail and
+    // take the better gain. Larger streams keep the prefix test: their
+    // full parse is pricier and the prefix verdict matched it better.
+    const sampleGain = (sample) => {
+      const zo = optimalZlibInner(sample, 48, 2, 64);
+      if (zo === null) return -1;
+      const zz = deflateSync(sample, FINAL_OPTS).length;
+      return 1 - zo.length / zz;
+    };
+    if (n <= 3000000) {
+      let gain = sampleGain(data.subarray(0, 262144));
+      if (gain < 0.025) gain = Math.max(gain, sampleGain(data.subarray(n - 262144, n)));
+      if (gain < 0.005) return null;
+      // A small sample gain means shallow chains understate the win
+      // (photo-like RGB): spend a deep chain. A clear gain needs less.
+      return optimalZlibInner(data, gain < 0.025 ? 224 : 112, 2, 64);
+    }
+    if (sampleGain(data.subarray(0, 262144)) < 0.025) return null;
+    return optimalZlibInner(data, 80, 2, 64);
+  }
+  return optimalZlibInner(data, n <= 1048576 ? 96 : 64, 4, 64);
+}
+function optimalZlibInner(data, maxChain, iterations, niceLen) {
+  const n = data.length;
+  const matches = findMatches(data, maxChain, niceLen);
 
   let litCost = costsOf(FIXED_LIT_LEN, 9);
   let distCost = costsOf(FIXED_DIST_LEN, 5);
   let tokens = null;
   let prevBits = Infinity;
   for (let iter = 0; iter < iterations; iter++) {
-    const parsed = optimalParse(data, matches, litCost, distCost);
+    const parsed = optimalParse(data, matches, litCost, distCost, n > 1200000 ? CAND_LENS_BIG : CAND_LENS);
     tokens = parsed.tokens;
     const { litFreq, distFreq } = countSymbols(tokens);
     const litLen = huffmanLengths(litFreq, 15);
@@ -834,7 +891,7 @@ function optimalZlib(data) {
 
   // Block splitting: equal-token splits plus a DP over chunk boundaries
   // (entropy-estimated block costs), each scored exactly by planBlock.
-  const splitCounts = tokens.length > 20000 ? [1, 2, 4] : [1];
+  const splitCounts = tokens.length > 20000 ? [1, 2, 3, 4, 6, 8] : [1];
   let bestPlan = null;
   const considerSplit = (bounds) => {
     const plans = [];
@@ -854,7 +911,7 @@ function optimalZlib(data) {
     considerSplit(bounds);
   }
   if (tokens.length > 8192) {
-    const CHUNK = 1024;
+    const CHUNK = 512;
     const nb = Math.ceil(tokens.length / CHUNK);
     const litPre = new Int32Array((nb + 1) * 288);
     const distPre = new Int32Array((nb + 1) * 32);
@@ -927,11 +984,10 @@ function optimalZlib(data) {
 }
 
 // ---------------------------------------------------------------- squeeze
-const SCREEN_OPTS = { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY }; // round 2: restored to 6 (L4 lost score)
+const SCREEN_OPTS = { level: 6, memLevel: 6, strategy: constants.Z_DEFAULT_STRATEGY };
 const FINAL_OPTS = { level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY };
 const SWEEP_BEST = [
   { level: 9, memLevel: 6, strategy: constants.Z_DEFAULT_STRATEGY },
-  { level: 9, memLevel: 7, strategy: constants.Z_FILTERED },
 ];
 // Optimal-parse work budget per image, in input-byte units: the best stream
 // always gets a run; a second stream only while the budget lasts. The budget
@@ -941,20 +997,25 @@ const OPTIMAL_BUDGET = 9000000;
 function squeezeImage(rgba, width, height) {
   const forms = candidateForms(rgba);
   const pool = [];
-  const built = forms.map((form) => ({ form, streams: cheapStreams(form.samples, width, height, form.bpp) }));
-  // Palette orderings: screen the unfiltered stream of each first and only
-  // full-screen the two best orderings (the rest cannot catch up).
-  const palBuilt = built.filter((b) => b.form.colourType === 3);
+  // Palette orderings: screen the unfiltered stream of each first (built
+  // directly, no filter work) and only build full stream sets for the two
+  // best orderings (the rest cannot catch up).
   let keepPal = null;
-  if (palBuilt.length > 2) {
-    const scored = palBuilt.map((b) => {
-      const s0 = b.streams.find((s) => s.choice === 0);
-      return { b, bytes: deflateSync(s0.data, SCREEN_OPTS).length + sideChunkBytes(b.form) };
+  const palForms = forms.filter((f) => f.colourType === 3);
+  if (palForms.length > 2) {
+    const stride0 = width * palForms[0].bpp;
+    const scored = palForms.map((form) => {
+      const d = new Uint8Array(height * (stride0 + 1));
+      for (let y = 0; y < height; y++) d.set(form.samples.subarray(y * stride0, (y + 1) * stride0), y * (stride0 + 1) + 1);
+      return { form, bytes: deflateSync(d, SCREEN_OPTS).length + sideChunkBytes(form) };
     }).sort((a, b) => a.bytes - b.bytes);
-    keepPal = new Set(scored.slice(0, 2).map((x) => x.b.form));
+    const greyImg = forms.some((f) => f.colourType === 0 || f.colourType === 4);
+    keepPal = new Set(scored.slice(0, greyImg ? 1 : 2).map((x) => x.form));
   }
+  const built = forms
+    .filter((form) => keepPal === null || form.colourType !== 3 || keepPal.has(form))
+    .map((form) => ({ form, streams: cheapStreams(form.samples, width, height, form.bpp) }));
   for (const { form, streams } of built) {
-    if (keepPal !== null && form.colourType === 3 && !keepPal.has(form)) continue;
     const side = sideChunkBytes(form);
     for (const s of streams) {
       pool.push({ form, choice: s.choice, data: s.data, screenBytes: deflateSync(s.data, SCREEN_OPTS).length + side });
@@ -963,7 +1024,7 @@ function squeezeImage(rgba, width, height) {
   pool.sort((a, b) => a.screenBytes - b.screenBytes || String(a.choice).localeCompare(String(b.choice)));
 
   // Brute-force per-row pass on the winning form.
-  const bruteForms = [pool[0].form];
+  const bruteForms = pool[0].form.bpp <= 2 ? [pool[0].form] : [];
   for (const form of bruteForms) {
     const data = bruteStream(form.samples, width, height, form.bpp);
     pool.push({ form, choice: 'brute', data, screenBytes: deflateSync(data, SCREEN_OPTS).length + sideChunkBytes(form) });
@@ -985,11 +1046,9 @@ function squeezeImage(rgba, width, height) {
   }
   pool.length = 0;
   pool.push(...uniquePool);
-  const finalists = pool.slice(0, 2);
+  const finalists = pool.length > 1 && pool[1].screenBytes <= pool[0].screenBytes * 1.08 ? pool.slice(0, 2) : pool.slice(0, 1);
   // Insurance: the winning form's fixed-Paeth stream always reaches the final.
   const winForm = pool[0].form;
-  const paeth = pool.find((c) => c.form === winForm && c.choice === 4);
-  if (paeth && !finalists.includes(paeth)) finalists.push(paeth);
 
   let best = null;
   const considerZlib = (cand, opts) => {
@@ -1000,19 +1059,22 @@ function squeezeImage(rgba, width, height) {
     }
     return total;
   };
-  const baseTotals = new Map();
-  for (const f of finalists) baseTotals.set(f, considerZlib(f, FINAL_OPTS));
-  const ranked = [...finalists].sort((a, b) => baseTotals.get(a) - baseTotals.get(b));
-  for (const p of SWEEP_BEST) considerZlib(ranked[0], p);
-
-  // Optimal-parsing deflate on the best stream (and the runner-up while the
-  // fixed work budget lasts and it is close enough to matter).
-  const optimalTargets = [ranked[0]];
-  for (const cand of optimalTargets) {
-    const z = optimalZlib(cand.data);
-    if (z === null) continue;
-    const total = PNG_FIXED_BYTES + sideChunkBytes(cand.form) + z.length;
-    if (total < best.total) best = { form: cand.form, z, total };
+  const ranked = [finalists[0]];
+  // Optimal-parsing deflate on the best stream first. The level-9 zlib
+  // pass (and the parameter sweep on big streams) only runs when the
+  // optimal parse is absent or within 3% of the level-6 screen, where
+  // level 9 could still plausibly win.
+  const cand0 = ranked[0];
+  const zOpt = optimalZlib(cand0.data);
+  let optTotal = Infinity;
+  if (zOpt !== null) {
+    optTotal = PNG_FIXED_BYTES + sideChunkBytes(cand0.form) + zOpt.length;
+    best = { form: cand0.form, z: zOpt, total: optTotal };
+  }
+  const screenTotal = PNG_FIXED_BYTES + cand0.screenBytes;
+  if (best === null || optTotal >= screenTotal * 0.97) {
+    considerZlib(cand0, FINAL_OPTS);
+    if (cand0.data.length > 1200000) for (const p of SWEEP_BEST) considerZlib(cand0, p);
   }
 
   return pngForForm(width, height, best.form, best.z);
